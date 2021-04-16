@@ -58,6 +58,9 @@ XLNET_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 
+# For relative bar encoding
+MAX_BAR_ENCODING = 20
+
 def build_tf_xlnet_to_pytorch_map(model, config, tf_weights=None):
     """
     A map of modules from TF to PyTorch. I use a map to keep the PyTorch model as identical to the original PyTorch
@@ -278,15 +281,23 @@ class XLNetRelativeAttention(nn.Module):
         attn_mask=None,
         head_mask=None,
         output_attentions=False,
+        pos_seq=None,
     ):
         """Core relative positional attention operations."""
+        """
+        Args:
+            pos_seq: of shape [bsz, qlen, klen]
+        """
 
         # content based attention score
         ac = torch.einsum("ibnd,jbnd->bnij", q_head + self.r_w_bias, k_head_h)
 
         # position based attention score
-        bd = torch.einsum("ibnd,jbnd->bnij", q_head + self.r_r_bias, k_head_r)
-        bd = self.rel_shift_bnij(bd, klen=ac.shape[3])
+        # bd = torch.einsum("ibnd,jbnd->bnij", q_head + self.r_r_bias, k_head_r)
+        bd_tmp = torch.einsum("ibnd,knd->bnik", q_head + self.r_r_bias, k_head_r)   # i: qlen, k: -MAX_BAR_ENCODING ~ MAX_BAR_ENCODING
+        pos_seq = pos_seq[:, None, :, :].expand(-1, bd_tmp.shape[1], -1, -1)
+        bd = torch.gather(bd_tmp, -1, pos_seq + MAX_BAR_ENCODING)
+        # bd = self.rel_shift_bnij(bd, klen=ac.shape[3])
 
         # segment based attention score
         if seg_mat is None:
@@ -344,6 +355,7 @@ class XLNetRelativeAttention(nn.Module):
         target_mapping=None,
         head_mask=None,
         output_attentions=False,
+        pos_seq=None,
     ):
         if g is not None:
             # Two-stream attention with relative positional encoding.
@@ -360,7 +372,9 @@ class XLNetRelativeAttention(nn.Module):
             v_head_h = torch.einsum("ibh,hnd->ibnd", cat, self.v)
 
             # position-based key head
-            k_head_r = torch.einsum("ibh,hnd->ibnd", r, self.r)
+            # k_head_r = torch.einsum("ibh,hnd->ibnd", r, self.r)
+            k_head_r = torch.einsum("ih,hnd->ind", r, self.r)
+            # k_head_r_3d = torch.einsum("ijbh,hnd->ijbnd", pos_emb, self.r)
 
             # h-stream
             # content-stream query head
@@ -376,6 +390,7 @@ class XLNetRelativeAttention(nn.Module):
                 attn_mask=attn_mask_h,
                 head_mask=head_mask,
                 output_attentions=output_attentions,
+                pos_seq=pos_seq,
             )
 
             if output_attentions:
@@ -400,6 +415,7 @@ class XLNetRelativeAttention(nn.Module):
                     attn_mask=attn_mask_g,
                     head_mask=head_mask,
                     output_attentions=output_attentions,
+                    pos_seq=pos_seq,
                 )
 
                 if output_attentions:
@@ -512,6 +528,7 @@ class XLNetLayer(nn.Module):
         target_mapping=None,
         head_mask=None,
         output_attentions=False,
+        pos_seq=None,
     ):
         outputs = self.rel_attn(
             output_h,
@@ -524,6 +541,7 @@ class XLNetLayer(nn.Module):
             target_mapping=target_mapping,
             head_mask=head_mask,
             output_attentions=output_attentions,
+            pos_seq=pos_seq,
         )
         output_h, output_g = outputs[:2]
 
@@ -939,7 +957,7 @@ XLNET_INPUTS_DOCSTRING = r"""
     XLNET_START_DOCSTRING,
 )
 class XLNetModel(XLNetPreTrainedModel):
-    def __init__(self, config):
+    def __init__(self, config, is_train=None):
         super().__init__(config)
 
         self.mem_len = config.mem_len
@@ -955,6 +973,8 @@ class XLNetModel(XLNetPreTrainedModel):
         self.mask_emb = nn.Parameter(torch.FloatTensor(1, 1, config.d_model))
         self.layer = nn.ModuleList([XLNetLayer(config) for _ in range(config.n_layer)])
         self.dropout = nn.Dropout(config.dropout)
+
+        self.is_train = is_train
 
         self.init_weights()
 
@@ -1029,44 +1049,76 @@ class XLNetModel(XLNetPreTrainedModel):
 
         return pos_emb
 
-    def relative_positional_encoding(self, qlen, klen, bsz=None):
+    def bar_ids_to_rel_bar_pos_emb(self, inv_freq, bar_ids, mlen=0):
+        """
+        Args:
+            bar_ids: of shape [bsz, qlen], bar encodings for notes starting from 0.
+                For example: [[0, 0, 1, 1, 2, 3], [0, 1, 1, 2, 2, 3]]
+
+        Returns:
+            pos_emb: of shape [qlen, qlen + mlen, bsz, hidden_size], i.e., ijbh in einstein summation
+        """
+        assert mlen == 0, "Transformer-XL's memory for previous chunks is not support for now"
+
+        bsz = bar_ids.shape[0]
+        qlen = bar_ids.shape[1]
+        klen = qlen + mlen
+
+        pos_seq = bar_ids[:, None, :].repeat(1, qlen, 1)
+        pos_seq = pos_seq - pos_seq[:, 0][..., None]
+        # sinusoid_inp = torch.einsum("bij,d->ijbd", pos_seq, inv_freq.to(pos_seq.device))
+        # pos_emb = torch.cat([torch.sin(sinusoid_inp), torch.cos(sinusoid_inp)], dim=-1)
+
+        pos_seq_1d = torch.arange(-MAX_BAR_ENCODING, MAX_BAR_ENCODING+1).to(pos_seq.device)
+        sinusoid_inp_1d = torch.einsum("i,d->id", pos_seq_1d, inv_freq.to(pos_seq.device))
+        pos_emb_1d = torch.cat([torch.sin(sinusoid_inp_1d), torch.cos(sinusoid_inp_1d)], dim=-1)
+
+        return pos_emb_1d, pos_seq
+
+    # def relative_positional_encoding(self, qlen, klen, bsz=None, bar_ids=None):
+    def relative_positional_encoding(self, bar_ids=None):
         # create relative positional encoding.
         freq_seq = torch.arange(0, self.d_model, 2.0, dtype=torch.float)
         inv_freq = 1 / torch.pow(10000, (freq_seq / self.d_model))
 
-        if self.attn_type == "bi":
-            # beg, end = klen - 1, -qlen
-            beg, end = klen, -qlen
-        elif self.attn_type == "uni":
-            # beg, end = klen - 1, -1
-            beg, end = klen, -1
+        # if self.attn_type == "bi":
+        #     # beg, end = klen - 1, -qlen
+        #     beg, end = klen, -qlen
+        # elif self.attn_type == "uni":
+        #     # beg, end = klen - 1, -1
+        #     beg, end = klen, -1
+        # else:
+        #     raise ValueError(f"Unknown `attn_type` {self.attn_type}.")
+
+        # if self.bi_data:
+        #     fwd_pos_seq = torch.arange(beg, end, -1.0, dtype=torch.float)
+        #     bwd_pos_seq = torch.arange(-beg, -end, 1.0, dtype=torch.float)
+
+        #     if self.clamp_len > 0:
+        #         fwd_pos_seq = fwd_pos_seq.clamp(-self.clamp_len, self.clamp_len)
+        #         bwd_pos_seq = bwd_pos_seq.clamp(-self.clamp_len, self.clamp_len)
+
+        #     if bsz is not None:
+        #         fwd_pos_emb = self.positional_embedding(fwd_pos_seq, inv_freq, bsz // 2)
+        #         bwd_pos_emb = self.positional_embedding(bwd_pos_seq, inv_freq, bsz // 2)
+        #     else:
+        #         fwd_pos_emb = self.positional_embedding(fwd_pos_seq, inv_freq)
+        #         bwd_pos_emb = self.positional_embedding(bwd_pos_seq, inv_freq)
+
+        #     pos_emb = torch.cat([fwd_pos_emb, bwd_pos_emb], dim=1)
+        # else:
+        #     fwd_pos_seq = torch.arange(beg, end, -1.0)
+        #     if self.clamp_len > 0:
+        #         fwd_pos_seq = fwd_pos_seq.clamp(-self.clamp_len, self.clamp_len)
+        #     pos_emb = self.positional_embedding(fwd_pos_seq, inv_freq, bsz)
+
+        if self.is_train:
+            pos_emb_1d, pos_seq = self.bar_ids_to_rel_bar_pos_emb(inv_freq, bar_ids)
         else:
-            raise ValueError(f"Unknown `attn_type` {self.attn_type}.")
+            pass
 
-        if self.bi_data:
-            fwd_pos_seq = torch.arange(beg, end, -1.0, dtype=torch.float)
-            bwd_pos_seq = torch.arange(-beg, -end, 1.0, dtype=torch.float)
-
-            if self.clamp_len > 0:
-                fwd_pos_seq = fwd_pos_seq.clamp(-self.clamp_len, self.clamp_len)
-                bwd_pos_seq = bwd_pos_seq.clamp(-self.clamp_len, self.clamp_len)
-
-            if bsz is not None:
-                fwd_pos_emb = self.positional_embedding(fwd_pos_seq, inv_freq, bsz // 2)
-                bwd_pos_emb = self.positional_embedding(bwd_pos_seq, inv_freq, bsz // 2)
-            else:
-                fwd_pos_emb = self.positional_embedding(fwd_pos_seq, inv_freq)
-                bwd_pos_emb = self.positional_embedding(bwd_pos_seq, inv_freq)
-
-            pos_emb = torch.cat([fwd_pos_emb, bwd_pos_emb], dim=1)
-        else:
-            fwd_pos_seq = torch.arange(beg, end, -1.0)
-            if self.clamp_len > 0:
-                fwd_pos_seq = fwd_pos_seq.clamp(-self.clamp_len, self.clamp_len)
-            pos_emb = self.positional_embedding(fwd_pos_seq, inv_freq, bsz)
-
-        pos_emb = pos_emb.to(self.device)
-        return pos_emb
+        # pos_emb = pos_emb.to(self.device)
+        return pos_emb_1d, pos_seq
 
     @add_start_docstrings_to_model_forward(XLNET_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
@@ -1090,6 +1142,7 @@ class XLNetModel(XLNetPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        bar_ids=None,
         **kwargs,  # delete after depreciation warning is removed
     ):
 
@@ -1189,7 +1242,8 @@ class XLNetModel(XLNetPreTrainedModel):
             word_emb_k = self.word_embedding(input_ids)
         output_h = self.dropout(word_emb_k)
         if target_mapping is not None:
-            word_emb_q = self.mask_emb.expand(target_mapping.shape[0], bsz, -1)
+            # word_emb_q = self.mask_emb.expand(target_mapping.shape[0], bsz, -1)
+            word_emb_q = inputs_embeds_g.transpose(0, 1).contiguous()
             # else:  # We removed the inp_q input which was same as target mapping
             #     inp_q_ext = inp_q[:, :, None]
             #     word_emb_q = inp_q_ext * self.mask_emb + (1 - inp_q_ext) * word_emb_k
@@ -1213,8 +1267,10 @@ class XLNetModel(XLNetPreTrainedModel):
             seg_mat = None
 
         # Positional encoding
-        pos_emb = self.relative_positional_encoding(qlen, klen, bsz=bsz)
-        pos_emb = self.dropout(pos_emb)
+        # pos_emb = self.relative_positional_encoding(qlen, klen, bsz=bsz, bar_ids=bar_ids)
+        pos_emb_1d, pos_seq = self.relative_positional_encoding(bar_ids=bar_ids)
+        # pos_emb = self.dropout(pos_emb)
+        pos_emb_1d = self.dropout(pos_emb_1d)
 
         # Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head
@@ -1251,12 +1307,13 @@ class XLNetModel(XLNetPreTrainedModel):
                 output_g,
                 attn_mask_h=non_tgt_mask,
                 attn_mask_g=attn_mask,
-                r=pos_emb,
+                r=pos_emb_1d,
                 seg_mat=seg_mat,
                 mems=mems[i],
                 target_mapping=target_mapping,
                 head_mask=head_mask[i],
                 output_attentions=output_attentions,
+                pos_seq=pos_seq,
             )
             output_h, output_g = outputs[:2]
             if output_attentions:
