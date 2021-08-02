@@ -1112,10 +1112,8 @@ class XLNetModel(XLNetPreTrainedModel):
         #         fwd_pos_seq = fwd_pos_seq.clamp(-self.clamp_len, self.clamp_len)
         #     pos_emb = self.positional_embedding(fwd_pos_seq, inv_freq, bsz)
 
-        if self.is_train:
-            pos_emb_1d, pos_seq = self.bar_ids_to_rel_bar_pos_emb(inv_freq, bar_ids)
-        else:
-            pass
+        # TODO: also work in testing phase?
+        pos_emb_1d, pos_seq = self.bar_ids_to_rel_bar_pos_emb(inv_freq, bar_ids)
 
         # pos_emb = pos_emb.to(self.device)
         return pos_emb_1d, pos_seq
@@ -1143,6 +1141,7 @@ class XLNetModel(XLNetPreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
         bar_ids=None,
+        inputs_embeds_g=None,
         **kwargs,  # delete after depreciation warning is removed
     ):
 
