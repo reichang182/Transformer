@@ -44,7 +44,6 @@ from ...modeling_utils import (
 from ...utils import logging
 from .configuration_xlnet import XLNetConfig
 
-
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "xlnet-base-cased"
@@ -59,7 +58,7 @@ XLNET_PRETRAINED_MODEL_ARCHIVE_LIST = [
 
 
 # For relative bar encoding
-MAX_BAR_ENCODING = 20
+MAX_BAR_ENCODING = 200
 
 def build_tf_xlnet_to_pytorch_map(model, config, tf_weights=None):
     """
@@ -296,7 +295,11 @@ class XLNetRelativeAttention(nn.Module):
         # bd = torch.einsum("ibnd,jbnd->bnij", q_head + self.r_r_bias, k_head_r)
         bd_tmp = torch.einsum("ibnd,knd->bnik", q_head + self.r_r_bias, k_head_r)   # i: qlen, k: -MAX_BAR_ENCODING ~ MAX_BAR_ENCODING
         pos_seq = pos_seq[:, None, :, :].expand(-1, bd_tmp.shape[1], -1, -1)
-        bd = torch.gather(bd_tmp, -1, pos_seq + MAX_BAR_ENCODING)
+        torch.set_printoptions(profile="full")
+        try:
+            bd = torch.gather(bd_tmp, -1, pos_seq + MAX_BAR_ENCODING)
+        except:
+            print(pos_seq + MAX_BAR_ENCODING)
         # bd = self.rel_shift_bnij(bd, klen=ac.shape[3])
 
         # segment based attention score
@@ -432,6 +435,7 @@ class XLNetRelativeAttention(nn.Module):
                     attn_mask=attn_mask_g,
                     head_mask=head_mask,
                     output_attentions=output_attentions,
+                    pos_seq=pos_seq,
                 )
 
                 if output_attentions:
@@ -457,7 +461,9 @@ class XLNetRelativeAttention(nn.Module):
 
             # positional heads
             # type casting for fp16 support
-            k_head_r = torch.einsum("ibh,hnd->ibnd", r.type(self.r.dtype), self.r)
+            # print(r.shape, self.r.shape)
+            # k_head_r = torch.einsum("ibh,hnd->ibnd", r.type(self.r.dtype), self.r)
+            k_head_r = torch.einsum("ih,hnd->ind", r, self.r)
 
             # core attention ops
             attn_vec = self.rel_attn_core(
@@ -469,6 +475,7 @@ class XLNetRelativeAttention(nn.Module):
                 attn_mask=attn_mask_h,
                 head_mask=head_mask,
                 output_attentions=output_attentions,
+                pos_seq=pos_seq,
             )
 
             if output_attentions:
@@ -957,7 +964,7 @@ XLNET_INPUTS_DOCSTRING = r"""
     XLNET_START_DOCSTRING,
 )
 class XLNetModel(XLNetPreTrainedModel):
-    def __init__(self, config, is_train=None):
+    def __init__(self, config):
         super().__init__(config)
 
         self.mem_len = config.mem_len
@@ -973,8 +980,6 @@ class XLNetModel(XLNetPreTrainedModel):
         self.mask_emb = nn.Parameter(torch.FloatTensor(1, 1, config.d_model))
         self.layer = nn.ModuleList([XLNetLayer(config) for _ in range(config.n_layer)])
         self.dropout = nn.Dropout(config.dropout)
-
-        self.is_train = is_train
 
         self.init_weights()
 
@@ -1052,20 +1057,22 @@ class XLNetModel(XLNetPreTrainedModel):
     def bar_ids_to_rel_bar_pos_emb(self, inv_freq, bar_ids, mlen=0):
         """
         Args:
-            bar_ids: of shape [bsz, qlen], bar encodings for notes starting from 0.
+            bar_ids: of shape [bsz, klen], bar encodings for notes starting from 0.
                 For example: [[0, 0, 1, 1, 2, 3], [0, 1, 1, 2, 2, 3]]
 
         Returns:
-            pos_emb: of shape [qlen, qlen + mlen, bsz, hidden_size], i.e., ijbh in einstein summation
+            pos_emb: of shape [klen, klen, bsz, hidden_size], i.e., ijbh in einstein summation
         """
-        assert mlen == 0, "Transformer-XL's memory for previous chunks is not support for now"
+        # assert mlen == 0, "Transformer-XL's memory for previous chunks is not support for now"
 
         bsz = bar_ids.shape[0]
-        qlen = bar_ids.shape[1]
-        klen = qlen + mlen
+        # qlen = bar_ids.shape[1]
+        # klen = qlen + mlen
+        klen = bar_ids.shape[1]
+        qlen = klen - mlen
 
         pos_seq = bar_ids[:, None, :].repeat(1, qlen, 1)
-        pos_seq = pos_seq - pos_seq[:, 0][..., None]
+        pos_seq = pos_seq - pos_seq[:, 0, -qlen:][..., None]
         # sinusoid_inp = torch.einsum("bij,d->ijbd", pos_seq, inv_freq.to(pos_seq.device))
         # pos_emb = torch.cat([torch.sin(sinusoid_inp), torch.cos(sinusoid_inp)], dim=-1)
 
@@ -1076,7 +1083,7 @@ class XLNetModel(XLNetPreTrainedModel):
         return pos_emb_1d, pos_seq
 
     # def relative_positional_encoding(self, qlen, klen, bsz=None, bar_ids=None):
-    def relative_positional_encoding(self, bar_ids=None):
+    def relative_positional_encoding(self, bar_ids=None, mlen=None):
         # create relative positional encoding.
         freq_seq = torch.arange(0, self.d_model, 2.0, dtype=torch.float)
         inv_freq = 1 / torch.pow(10000, (freq_seq / self.d_model))
@@ -1113,7 +1120,7 @@ class XLNetModel(XLNetPreTrainedModel):
         #     pos_emb = self.positional_embedding(fwd_pos_seq, inv_freq, bsz)
 
         # TODO: also work in testing phase?
-        pos_emb_1d, pos_seq = self.bar_ids_to_rel_bar_pos_emb(inv_freq, bar_ids)
+        pos_emb_1d, pos_seq = self.bar_ids_to_rel_bar_pos_emb(inv_freq, bar_ids, mlen)
 
         # pos_emb = pos_emb.to(self.device)
         return pos_emb_1d, pos_seq
@@ -1221,7 +1228,8 @@ class XLNetModel(XLNetPreTrainedModel):
             if attn_mask is None:
                 attn_mask = data_mask[:, :, :, None]
             else:
-                attn_mask += data_mask[:, :, :, None]
+                # attn_mask += data_mask[:, :, :, None]
+                attn_mask = data_mask[:, :, :, None] + attn_mask
 
         if attn_mask is not None:
             attn_mask = (attn_mask > 0).to(dtype_float)
@@ -1248,7 +1256,9 @@ class XLNetModel(XLNetPreTrainedModel):
             #     word_emb_q = inp_q_ext * self.mask_emb + (1 - inp_q_ext) * word_emb_k
             output_g = self.dropout(word_emb_q)
         else:
-            output_g = None
+            # output_g = None
+            word_emb_q = inputs_embeds_g.transpose(0, 1).contiguous()
+            output_g = self.dropout(word_emb_q)
 
         # Segment embedding
         if token_type_ids is not None:
@@ -1267,7 +1277,7 @@ class XLNetModel(XLNetPreTrainedModel):
 
         # Positional encoding
         # pos_emb = self.relative_positional_encoding(qlen, klen, bsz=bsz, bar_ids=bar_ids)
-        pos_emb_1d, pos_seq = self.relative_positional_encoding(bar_ids=bar_ids)
+        pos_emb_1d, pos_seq = self.relative_positional_encoding(bar_ids=bar_ids, mlen=mlen)
         # pos_emb = self.dropout(pos_emb)
         pos_emb_1d = self.dropout(pos_emb_1d)
 
