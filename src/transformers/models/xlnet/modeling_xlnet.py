@@ -295,11 +295,7 @@ class XLNetRelativeAttention(nn.Module):
         # bd = torch.einsum("ibnd,jbnd->bnij", q_head + self.r_r_bias, k_head_r)
         bd_tmp = torch.einsum("ibnd,knd->bnik", q_head + self.r_r_bias, k_head_r)   # i: qlen, k: -MAX_BAR_ENCODING ~ MAX_BAR_ENCODING
         pos_seq = pos_seq[:, None, :, :].expand(-1, bd_tmp.shape[1], -1, -1)
-        torch.set_printoptions(profile="full")
-        try:
-            bd = torch.gather(bd_tmp, -1, pos_seq + MAX_BAR_ENCODING)
-        except:
-            print(pos_seq + MAX_BAR_ENCODING)
+        bd = torch.gather(bd_tmp, -1, pos_seq + MAX_BAR_ENCODING)
         # bd = self.rel_shift_bnij(bd, klen=ac.shape[3])
 
         # segment based attention score
@@ -1012,7 +1008,7 @@ class XLNetModel(XLNetPreTrainedModel):
 
         """
         attn_mask = torch.ones([qlen, qlen])
-        mask_up = torch.triu(attn_mask, diagonal=1)
+        mask_up = torch.triu(attn_mask, diagonal=0) # change to 0, since we do not want input_g to attend to itself
         attn_mask_pad = torch.zeros([qlen, mlen])
         ret = torch.cat([attn_mask_pad, mask_up], dim=1)
         if self.same_length:
@@ -1040,7 +1036,6 @@ class XLNetModel(XLNetPreTrainedModel):
             new_mem = curr_out[cutoff:]
         else:
             new_mem = torch.cat([prev_mem, curr_out], dim=0)[cutoff:]
-
         return new_mem.detach()
 
     @staticmethod
@@ -1149,6 +1144,7 @@ class XLNetModel(XLNetPreTrainedModel):
         return_dict=None,
         bar_ids=None,
         inputs_embeds_g=None,
+        reuse_len=None,
         **kwargs,  # delete after depreciation warning is removed
     ):
 
@@ -1164,6 +1160,8 @@ class XLNetModel(XLNetPreTrainedModel):
                 FutureWarning,
             )
             use_mems = kwargs["use_cache"]
+
+        self.reuse_len = reuse_len  # reuse len should be modified if specified by user
 
         if self.training:
             use_mems = use_mems if use_mems is not None else self.config.use_mems_train
